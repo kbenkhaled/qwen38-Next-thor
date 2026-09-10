@@ -1,0 +1,156 @@
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -31,11 +31,14 @@
+     create_fp8_weight_parameter,
+     is_fp8,
+ )
++from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++    dequantize_to_dtype,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     is_layer_skipped,
+ )
+ from vllm.model_executor.models.utils import AutoWeightsLoader
+-from vllm.model_executor.parameter import PerTensorScaleParameter
++from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
+@@ -130,11 +133,76 @@
+         return F.embedding(input_, layer.weight)
+ 
+ 
++class Qwen4ExpPLENVFP4EmbeddingMethod(QuantizeMethodBase):
++    """Packed GPU PLE table with FP8 block scales and one FP32 global scale."""
++
++    def create_weights(
++        self,
++        layer: nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size, output_size, params_dtype
++        if input_size_per_partition % 16:
++            raise ValueError("NVFP4 PLE head dimension must be divisible by 16")
++        rows = sum(output_partition_sizes)
++        weight_loader = extra_weight_attrs.get("weight_loader")
++        for name, divisor, dtype in (
++            ("weight", 2, torch.uint8),
++            ("weight_scale", 16, torch.float8_e4m3fn),
++        ):
++            layer.register_parameter(
++                name,
++                ModelWeightParameter(
++                    data=torch.empty(
++                        rows, input_size_per_partition // divisor, dtype=dtype
++                    ),
++                    input_dim=1,
++                    output_dim=0,
++                    weight_loader=weight_loader,
++                ),
++            )
++        layer.register_parameter(
++            "weight_scale_2",
++            PerTensorScaleParameter(
++                data=torch.full((1,), float("nan"), dtype=torch.float32),
++                weight_loader=weight_loader,
++            ),
++        )
++
++    def apply(
++        self,
++        layer: nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        raise NotImplementedError("PLE NVFP4 weights only support embedding lookup")
++
++    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        # Use 2D rows so the helper applies the table's single global scale.
++        row_ids = input_.reshape(-1)
++        return dequantize_to_dtype(
++            F.embedding(row_ids, layer.weight),
++            F.embedding(row_ids, layer.weight_scale),
++            layer.weight_scale_2,
++            layer.params_dtype,
++            swizzle=False,
++        ).reshape(*input_.shape, layer.embedding_dim)
++
++
+ def _get_ple_embedding_quant_method(
+     quant_config: QuantizationConfig | None,
+     prefix: str,
++    ple_embedding_dtype: str | None = None,
+ ) -> QuantizeMethodBase | None:
+-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
++    """Select the table's format independently of the model's linear weights."""
++
++    if ple_embedding_dtype == "nvfp4":
++        return Qwen4ExpPLENVFP4EmbeddingMethod()
+ 
+     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+         if quant_config._resolve_quant_algo(prefix) == "FP8":
+@@ -324,7 +392,9 @@
+             padding_size=divisor,
+             prefix=f"{prefix}.ngram_embedding",
+             quant_method=_get_ple_embedding_quant_method(
+-                quant_config, f"{prefix}.ngram_embedding"
++                quant_config,
++                f"{prefix}.ngram_embedding",
++                getattr(config, "ple_embedding_dtype", None),
+             ),
+         )
+ 
+@@ -472,8 +542,8 @@
+                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                 loaded.add(name)
+                 continue
+-            if name.startswith(shard_prefix) and name.endswith(".weight"):
+-                shard_text = name[len(shard_prefix) : -len(".weight")]
++            if name.startswith(shard_prefix) and leaf_name in ("weight", "weight_scale"):
++                shard_text = name[len(shard_prefix) : -len(leaf_name) - 1]
+                 if not shard_text.isdigit():
+                     regular_weights.append((name, loaded_weight))
+                     continue
+@@ -492,19 +562,23 @@
+                     0,
+                     min(shard_size, embedding.org_vocab_size - checkpoint_start),
+                 )
+-                expected_shape = (expected_rows, embedding.embedding_dim)
++                param = getattr(embedding, leaf_name)
++                expected_shape = (expected_rows, *param.shape[1:])
+                 if tuple(loaded_weight.shape) != expected_shape:
+                     raise ValueError(
+                         f"Shape mismatch for PLE embedding shard {shard_index}: "
+                         f"expected {expected_shape}, got "
+                         f"{tuple(loaded_weight.shape)}"
+                     )
+-                embedding.weight.weight_loader(
+-                    embedding.weight,
++                if isinstance(embedding.quant_method, Qwen4ExpPLENVFP4EmbeddingMethod):
++                    if loaded_weight.dtype != param.dtype:
++                        raise ValueError(f"Invalid NVFP4 PLE dtype for {name}")
++                param.weight_loader(
++                    param,
+                     loaded_weight,
+                     checkpoint_start=checkpoint_start,
+                 )
+-                loaded.add("ngram_embedding.weight")
++                loaded.add(f"ngram_embedding.{leaf_name}")
+                 continue
+             regular_weights.append((name, loaded_weight))
+ 
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -484,6 +484,7 @@
+         logits.shape[0] <= 64
+         and logits.stride(0) % 4 == 0
+         and current_platform.has_device_capability(90)
++        and not current_platform.is_device_capability_family(110)
+         and not current_platform.is_device_capability_family(120)
+     )
+     topk_op = (
